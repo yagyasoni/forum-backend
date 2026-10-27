@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { pool } from "../config/db.js";
+import { rateLimit } from "../middleware/rateLimit.js";
 import { authorColumns, authorJoin, mapAuthor } from "../sql/author.js";
 import {
   PAGE_SIZE,
@@ -100,6 +101,71 @@ router.get("/:id/comments", async (req, res) => {
   if (visible.rowCount === 0) return res.status(404).json({ error: "Thread not found" });
 
   res.json({ items: await loadComments(id) });
+});
+
+// PUT /api/threads/:id/vote   body { value: 1 | -1 | 0 }   header X-Forum-Voter: <device id>
+// Records this voter's vote on the thread (0 removes it) and adjusts the thread's score.
+// One row per voter per thread, so repeating a vote never counts twice.
+// Replies { score, myVote } so the caller can show the result without a second request.
+const VOTER_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const voteLimiter = rateLimit({ windowMs: 60_000, max: 60 });
+
+router.put("/:id/vote", voteLimiter, async (req, res) => {
+  const { id } = req.params;
+  if (!UUID_RE.test(id)) return res.status(404).json({ error: "Thread not found" });
+
+  const voter = req.get("x-forum-voter") ?? "";
+  if (!VOTER_RE.test(voter)) return res.status(400).json({ error: "X-Forum-Voter header is required" });
+
+  const value = req.body?.value;
+  if (![1, -1, 0].includes(value)) return res.status(400).json({ error: "value must be 1, -1, or 0" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Lock the thread row so two votes on the same thread adjust the score one after the other.
+    const thread = await client.query(
+      `SELECT t.like_count FROM forum_threads t
+       JOIN forum_categories c ON c.id = t.category_id
+       WHERE t.id = $1 AND NOT t.is_deleted AND NOT c.members_only
+       FOR UPDATE OF t`,
+      [id]
+    );
+    if (thread.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Thread not found" });
+    }
+
+    const previous = await client.query(
+      `SELECT value FROM forum_votes WHERE voter_id = $1 AND thread_id = $2`,
+      [voter, id]
+    );
+    const oldValue = previous.rows[0]?.value ?? 0;
+
+    if (value === 0) {
+      await client.query(`DELETE FROM forum_votes WHERE voter_id = $1 AND thread_id = $2`, [voter, id]);
+    } else {
+      await client.query(
+        `INSERT INTO forum_votes (voter_id, thread_id, value) VALUES ($1, $2, $3)
+         ON CONFLICT (voter_id, thread_id) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [voter, id, value]
+      );
+    }
+
+    const updated = await client.query(
+      `UPDATE forum_threads SET like_count = like_count + $2 WHERE id = $1 RETURNING like_count`,
+      [id, value - oldValue]
+    );
+
+    await client.query("COMMIT");
+    res.json({ score: updated.rows[0].like_count, myVote: value });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 });
 
 export default router;
