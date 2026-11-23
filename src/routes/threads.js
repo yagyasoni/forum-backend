@@ -44,20 +44,29 @@ function checkProfanity(f, ...texts) {
   return null;
 }
 
-async function loadComments(threadId) {
+async function loadComments(threadId, userId = null) {
+  const params = [threadId];
+  const likedJoin = userId
+    ? `LEFT JOIN forum_comment_likes fcl ON fcl.comment_id = cm.id AND fcl.user_id = $2`
+    : "";
+  const likedCol = userId ? ", (fcl.comment_id IS NOT NULL) AS liked_by_me" : "";
+  if (userId) params.push(userId);
+
   const { rows } = await pool.query(
-    `SELECT cm.id, cm.body, cm.like_count, cm.created_at, ${authorColumns("cm")}
+    `SELECT cm.id, cm.body, cm.like_count, cm.created_at${likedCol}, ${authorColumns("cm")}
      FROM forum_comments cm
      ${authorJoin("cm")}
+     ${likedJoin}
      WHERE cm.thread_id = $1 AND NOT cm.is_deleted
      ORDER BY cm.created_at, cm.id`,
-    [threadId]
+    params
   );
   return rows.map((c) => ({
     id: c.id,
     author: mapAuthor(c),
     body: c.body,
     likeCount: c.like_count,
+    likedByMe: c.liked_by_me ?? false,
     createdAt: c.created_at,
   }));
 }
@@ -116,7 +125,7 @@ router.get("/:id", async (req, res) => {
   const threadParams = req.user ? [id, req.user.id] : [id];
   const [threadResult, comments] = await Promise.all([
     pool.query(`SELECT ${threadColumns} ${mc}, t.body ${threadFrom} ${vis} AND t.id = $1`, threadParams),
-    loadComments(id),
+    loadComments(id, req.user?.id),
   ]);
 
   const row = threadResult.rows[0];
@@ -138,7 +147,7 @@ router.get("/:id/comments", async (req, res) => {
   );
   if (visible.rowCount === 0) return res.status(404).json({ error: "Thread not found" });
 
-  res.json({ items: await loadComments(id) });
+  res.json({ items: await loadComments(id, req.user?.id) });
 });
 
 // PUT /api/threads/:id/vote  — works for visitors (device id header) and members (cookie)
@@ -276,6 +285,40 @@ router.post("/", requireMember, requireProfile, async (req, res) => {
   );
 
   res.status(201).json(rows[0]);
+});
+
+// PUT /api/threads/:id/comments/:commentId/like — toggle like, one per member
+router.put("/:id/comments/:commentId/like", requireMember, async (req, res) => {
+  const { commentId } = req.params;
+  if (!UUID_RE.test(commentId)) return res.status(404).json({ error: "Comment not found" });
+
+  const existing = await pool.query(
+    `SELECT 1 FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+    [commentId, req.user.id]
+  );
+
+  let delta;
+  if (existing.rowCount > 0) {
+    await pool.query(
+      `DELETE FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+      [commentId, req.user.id]
+    );
+    delta = -1;
+  } else {
+    await pool.query(
+      `INSERT INTO forum_comment_likes (comment_id, user_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING`,
+      [commentId, req.user.id]
+    );
+    delta = 1;
+  }
+
+  const updated = await pool.query(
+    `UPDATE forum_comments SET like_count = GREATEST(0, like_count + $1) WHERE id = $2::uuid RETURNING like_count`,
+    [delta, commentId]
+  );
+  if (updated.rowCount === 0) return res.status(404).json({ error: "Comment not found" });
+
+  res.json({ likeCount: updated.rows[0].like_count });
 });
 
 // POST /api/threads/:id/comments
