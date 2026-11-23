@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { pool } from "../config/db.js";
-import { PAGE_SIZE, TABS, pageResult, parsePage, threadColumns, threadFrom } from "../sql/threads.js";
+import { PAGE_SIZE, TABS, memberColumns, pageResult, parsePage, threadColumns, threadFrom, visibilityClause } from "../sql/threads.js";
 
 const router = Router();
 
@@ -13,8 +13,9 @@ router.get("/", async (req, res) => {
   const tab = TABS[req.query.tab ?? "latest"];
   if (!tab) return res.status(400).json({ error: "tab must be latest, top, or unanswered" });
 
+  const vis = visibilityClause(req);
   const filterParams = [];
-  let filters = tab.where;
+  let filters = vis + " " + tab.where;
   if (req.query.category) {
     filterParams.push(String(req.query.category));
     filters += ` AND c.slug = $${filterParams.length}`;
@@ -28,13 +29,15 @@ router.get("/", async (req, res) => {
     order = `ts_rank(t.search_vector, ${tsq}) DESC, t.last_activity_at DESC, t.id`;
   }
   const n = filterParams.length;
+  const userParams = req.user ? [req.user.id] : [];
+  const mc = req.user ? memberColumns(n + 1) : "";
 
   const [list, count] = await Promise.all([
     pool.query(
-      `SELECT ${threadColumns} ${threadFrom} ${filters}
+      `SELECT ${threadColumns} ${mc} ${threadFrom} ${filters}
        ORDER BY ${order}
-       LIMIT $${n + 1} OFFSET $${n + 2}`,
-      [...filterParams, PAGE_SIZE, (page - 1) * PAGE_SIZE]
+       LIMIT $${n + userParams.length + 1} OFFSET $${n + userParams.length + 2}`,
+      [...filterParams, ...userParams, PAGE_SIZE, (page - 1) * PAGE_SIZE]
     ),
     pool.query(`SELECT count(*)::int AS total ${threadFrom} ${filters}`, filterParams),
   ]);
