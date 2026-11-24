@@ -82,7 +82,7 @@ router.post("/google", loginRateLimit, async (req, res) => {
       const insert = await client.query(
         `INSERT INTO users (name, email, is_verified, status)
          VALUES ($1, $2, true, 'active') RETURNING id`,
-        [name, email]
+        [name || email.split("@")[0], email] // users.name is required; some Google accounts have none
       );
       userId = insert.rows[0].id;
     }

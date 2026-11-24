@@ -13,6 +13,11 @@ import { writeRateLimit } from "./middleware/rateLimiter.js";
 
 const app = express();
 
+// The API sits behind nginx on the same machine. Trust its X-Forwarded-For so req.ip is the
+// visitor's address; without this every request looks like 127.0.0.1 and all visitors would
+// share one rate-limit bucket. Same setting as audit-backend.
+app.set("trust proxy", "loopback");
+
 const origins = process.env.CORS_ORIGIN?.split(",").map((o) => o.trim()).filter(Boolean) ?? [];
 app.use(
   cors({

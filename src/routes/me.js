@@ -7,11 +7,22 @@ const router = Router();
 
 const VALID_ROLES = ["owner", "pharmacist", "technician", "consultant", "student"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // GET /api/me
 router.get("/", requireMember, async (req, res) => {
   const [userResult, unreadResult] = await Promise.all([
-    pool.query(`SELECT id, email, is_verified FROM users WHERE id = $1::uuid`, [req.user.id]),
+    // "verified" is the Verified Pharmacy tag: a pharmacy with an NPI or NCPDP on file,
+    // the same rule the author columns use. It is not the email-verified flag.
+    pool.query(
+      `SELECT u.id, u.email,
+              EXISTS (
+                SELECT 1 FROM pharmacy_details pd
+                WHERE pd.user_id = u.id AND (pd.npi_number IS NOT NULL OR pd.ncpdp_number IS NOT NULL)
+              ) AS verified
+       FROM users u WHERE u.id = $1::uuid`,
+      [req.user.id]
+    ),
     pool.query(
       `SELECT count(*)::int AS unread FROM forum_notifications WHERE user_id = $1::uuid AND NOT is_read`,
       [req.user.id]
@@ -22,7 +33,7 @@ router.get("/", requireMember, async (req, res) => {
   res.json({
     id: u.id,
     email: u.email,
-    verified: u.is_verified,
+    verified: u.verified,
     unread: unreadResult.rows[0].unread,
     profile: req.user.profile,
   });
@@ -38,7 +49,10 @@ router.put("/profile", requireMember, async (req, res) => {
   if (!role || !VALID_ROLES.includes(role))
     return res.status(400).json({ error: "Role must be one of: " + VALID_ROLES.join(", ") });
 
-  const categoryIds = Array.isArray(favoriteCategoryIds) ? favoriteCategoryIds : [];
+  // The column is uuid[]; anything that is not a category id would make the insert fail.
+  const categoryIds = Array.isArray(favoriteCategoryIds)
+    ? favoriteCategoryIds.filter((id) => typeof id === "string" && UUID_RE.test(id))
+    : [];
 
   try {
     const { rows } = await pool.query(
