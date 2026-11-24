@@ -14,22 +14,33 @@ export const TABS = {
 };
 const EXCERPT_LENGTH = 180;
 
-// FROM clause plus the visitor exclusions. Callers append further AND conditions.
+// Returns the members_only filter clause. Members see all categories; visitors see none.
+export function visibilityClause(req) {
+  return req?.user ? "" : "AND NOT c.members_only";
+}
+
+// FROM clause. Callers append visibilityClause(req) and further AND conditions.
 export const threadFrom = `
   FROM forum_threads t
   JOIN forum_categories c ON c.id = t.category_id
   ${authorJoin("t")}
-  WHERE NOT t.is_deleted
-    AND NOT c.members_only`;
+  WHERE NOT t.is_deleted`;
 
-// The excerpt is the body as plain text: tags stripped, whitespace collapsed.
-// One character past the limit is fetched so the route knows when to add "…".
+// Base columns — always included.
 export const threadColumns = `
   t.id, t.title, t.image_url, t.is_pinned, t.is_locked, t.view_count, t.comment_count, t.like_count,
   t.last_activity_at, t.created_at,
   left(trim(regexp_replace(regexp_replace(t.body, '<[^>]+>', ' ', 'g'), '\\s+', ' ', 'g')), ${EXCERPT_LENGTH + 1}) AS excerpt,
   c.slug AS category_slug, c.name AS category_name,
   ${authorColumns("t")}`;
+
+// Extra columns added when a member is signed in.
+// `paramIndex` is the $N position where the caller places userId in its params array.
+export function memberColumns(paramIndex) {
+  return `,
+    COALESCE((SELECT fv.value FROM forum_votes fv WHERE fv.thread_id = t.id AND fv.voter_id = $${paramIndex}::text), 0) AS my_vote,
+    EXISTS (SELECT 1 FROM forum_saves fs WHERE fs.thread_id = t.id AND fs.user_id = $${paramIndex}::uuid) AS saved`;
+}
 
 function toExcerpt(text) {
   return text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH).trimEnd()}…` : text;
@@ -50,6 +61,8 @@ export function mapThreadRow(row) {
     likeCount: row.like_count,
     lastActivityAt: row.last_activity_at,
     createdAt: row.created_at,
+    myVote: row.my_vote ?? 0,
+    saved: row.saved ?? false,
   };
 }
 
