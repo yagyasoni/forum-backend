@@ -11,7 +11,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // GET /api/me
 router.get("/", requireMember, async (req, res) => {
-  const [userResult, unreadResult] = await Promise.all([
+  const [userResult, unreadResult, votesResult] = await Promise.all([
     // "verified" is the Verified Pharmacy tag: a pharmacy with an NPI or NCPDP on file,
     // the same rule the author columns use. It is not the email-verified flag.
     pool.query(
@@ -27,6 +27,11 @@ router.get("/", requireMember, async (req, res) => {
       `SELECT count(*)::int AS unread FROM forum_notifications WHERE user_id = $1::uuid AND NOT is_read`,
       [req.user.id]
     ),
+    // The member's own votes, so the arrows are right on any device without a second request.
+    pool.query(
+      `SELECT thread_id, value FROM forum_votes WHERE voter_id = $1::text ORDER BY updated_at DESC LIMIT 1000`,
+      [req.user.id]
+    ),
   ]);
 
   const u = userResult.rows[0];
@@ -35,6 +40,7 @@ router.get("/", requireMember, async (req, res) => {
     email: u.email,
     verified: u.verified,
     unread: unreadResult.rows[0].unread,
+    votes: Object.fromEntries(votesResult.rows.map((v) => [v.thread_id, v.value])),
     profile: req.user.profile,
   });
 });

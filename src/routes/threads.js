@@ -168,19 +168,25 @@ router.put("/:id/vote", async (req, res) => {
   if (!VOTER_RE.test(voterId))
     return res.status(400).json({ error: "Missing or invalid X-Forum-Voter header." });
 
-  // Check thread exists and is not locked.
-  const threadResult = await pool.query(
-    `SELECT t.id, t.is_locked, t.like_count FROM forum_threads t
-     JOIN forum_categories c ON c.id = t.category_id
-     WHERE t.id = $1 AND NOT t.is_deleted`,
-    [id]
-  );
-  if (threadResult.rowCount === 0) return res.status(404).json({ error: "Thread not found" });
-  if (threadResult.rows[0].is_locked) return res.status(403).json({ error: "Thread is locked." });
-
+  const vis = visibilityClause(req);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    // Lock the thread row for this transaction so two votes arriving together are applied one
+    // after the other and the score cannot drift. Locked threads still accept votes; only
+    // comments are closed on them.
+    const threadResult = await client.query(
+      `SELECT t.id FROM forum_threads t
+       JOIN forum_categories c ON c.id = t.category_id
+       WHERE t.id = $1::uuid AND NOT t.is_deleted ${vis}
+       FOR UPDATE OF t`,
+      [id]
+    );
+    if (threadResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Thread not found" });
+    }
 
     // Get existing vote if any.
     const existing = await client.query(

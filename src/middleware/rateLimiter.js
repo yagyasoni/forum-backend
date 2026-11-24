@@ -41,13 +41,20 @@ export function loginRateLimit(req, res, next) {
 }
 
 /**
- * Write rate limiter: 20 per minute per user (by user id or IP for visitors).
+ * Write rate limiter, per user (by user id, or IP for visitors). Two separate budgets:
+ *   - content (posts, comments, uploads, profile): 20 per minute
+ *   - reactions (vote, like, save): 60 per minute. These are one click each and people toggle
+ *     them quickly; counting them against the content budget threw ordinary votes back.
  * Must run after optionalMember so req.user is set.
  */
+const REACTION_PATH = /\/(vote|like|save)\/?$/;
+
 export function writeRateLimit(req, res, next) {
   const WINDOW = 60 * 1000; // 1 minute
-  const key = req.user ? `write:user:${req.user.id}` : `write:ip:${req.ip ?? "unknown"}`;
-  if (hit(key, 20, WINDOW)) {
+  const reaction = REACTION_PATH.test(req.path);
+  const who = req.user ? `user:${req.user.id}` : `ip:${req.ip ?? "unknown"}`;
+  const key = `${reaction ? "react" : "write"}:${who}`;
+  if (hit(key, reaction ? 60 : 20, WINDOW)) {
     return res.status(429).json({ error: "Too many requests. Slow down." });
   }
   next();
