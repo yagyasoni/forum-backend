@@ -316,7 +316,7 @@ router.post("/", requireMember, requireProfile, async (req, res) => {
 // PUT /api/threads/:id/comments/:commentId/like — one like per member per comment.
 // Body { liked: true | false } sets that state (sending it twice changes nothing). Without a body it
 // flips the current state, which is what earlier versions of the frontend expect.
-router.put("/:id/comments/:commentId/like", requireMember, async (req, res) => {
+router.put("/:id/comments/:commentId/like", requireMember, requireProfile, async (req, res) => {
   const { id, commentId } = req.params;
   if (!UUID_RE.test(id) || !UUID_RE.test(commentId)) return res.status(404).json({ error: "Comment not found" });
 

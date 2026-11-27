@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import { pool } from "../config/db.js";
 import { requireMember } from "../middleware/auth.js";
 import { loginRateLimit } from "../middleware/rateLimiter.js";
+import { memberForGoogle, memberForUser, moveVotes } from "../sql/members.js";
 
 const router = Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -18,37 +19,9 @@ const COOKIE_OPTS = () => ({
   maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
 });
 
+// userId in the token is the forum member id (the same as the users id for AuditProRx accounts).
 function issueToken(userId) {
   return jwt.sign({ userId }, process.env.FORUM_JWT_SECRET, { expiresIn: "30d" });
-}
-
-// Move device votes to the authenticated user inside an open transaction client.
-// Returns { threadId: newScore } for the threads whose score changed, so the browser can correct
-// what it is showing without reloading: that only happens where the member had already voted on a
-// thread from their account and this browser had voted on it again while signed out.
-async function migrateDeviceVotes(client, userId, deviceId) {
-  if (!deviceId || !/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) return {};
-
-  // Threads the device voted on that the user hasn't voted on: take them over.
-  await client.query(
-    `UPDATE forum_votes SET voter_id = $1, updated_at = now()
-     WHERE voter_id = $2
-       AND NOT EXISTS (
-         SELECT 1 FROM forum_votes u WHERE u.voter_id = $1 AND u.thread_id = forum_votes.thread_id
-       )`,
-    [userId, deviceId]
-  );
-
-  // Threads both voted on: remove the device vote and subtract its value from the score.
-  const corrected = await client.query(
-    `UPDATE forum_threads t SET like_count = t.like_count - v.value
-     FROM forum_votes v
-     WHERE v.thread_id = t.id AND v.voter_id = $1
-     RETURNING t.id, t.like_count`,
-    [deviceId]
-  );
-  await client.query(`DELETE FROM forum_votes WHERE voter_id = $1`, [deviceId]);
-  return Object.fromEntries(corrected.rows.map((t) => [t.id, t.like_count]));
 }
 
 // POST /api/auth/google
@@ -73,39 +46,20 @@ router.post("/google", loginRateLimit, async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Find or create user.
-    let { rows } = await client.query(`SELECT id, status FROM users WHERE email = $1`, [email]);
-    let userId;
-
-    if (rows.length > 0) {
-      if (rows[0].status !== "active") {
-        await client.query("ROLLBACK");
-        return res.status(403).json({ error: "Account inactive" });
-      }
-      userId = rows[0].id;
-    } else {
-      const insert = await client.query(
-        `INSERT INTO users (name, email, is_verified, status)
-         VALUES ($1, $2, true, 'active') RETURNING id`,
-        [name || email.split("@")[0], email] // users.name is required; some Google accounts have none
-      );
-      userId = insert.rows[0].id;
+    // A Google email AuditProRx does not know gets a forum-only member, never a users row.
+    const member = await memberForGoogle(client, { email, name, sub });
+    if (member.error) {
+      await client.query("ROLLBACK");
+      return res.status(member.status).json({ error: member.error });
     }
 
-    // Upsert auth_providers row.
-    await client.query(
-      `INSERT INTO auth_providers (user_id, provider, provider_user_id)
-       VALUES ($1, 'google', $2)
-       ON CONFLICT (user_id, provider) DO UPDATE SET provider_user_id = EXCLUDED.provider_user_id`,
-      [userId, sub]
-    );
-
-    const scores = await migrateDeviceVotes(client, userId, deviceId);
+    // `scores` tells the browser which thread scores changed while its votes were merged in.
+    const scores = await moveVotes(client, member.id, deviceId);
     await client.query("COMMIT");
 
-    const hasProfile = await checkHasProfile(userId);
-    res.cookie("forum_session", issueToken(userId), COOKIE_OPTS());
-    res.json({ user: { id: userId, hasProfile }, scores });
+    const hasProfile = await checkHasProfile(member.id);
+    res.cookie("forum_session", issueToken(member.id), COOKIE_OPTS());
+    res.json({ user: { id: member.id, hasProfile }, scores });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("Google login error:", err);
@@ -121,7 +75,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
 
   const { rows } = await pool.query(
-    `SELECT id, password, is_verified, status FROM users WHERE email = $1`,
+    `SELECT id, name, email, password, is_verified, status FROM users WHERE email = $1`,
     [String(email).toLowerCase()]
   );
 
@@ -141,12 +95,13 @@ router.post("/login", loginRateLimit, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    scores = await migrateDeviceVotes(client, user.id, deviceId);
+    await memberForUser(client, user);
+    scores = await moveVotes(client, user.id, deviceId);
     await client.query("COMMIT");
   } catch (err) {
-    scores = {};
     await client.query("ROLLBACK");
-    console.error("Device vote migration error:", err);
+    console.error("Login member error:", err);
+    return res.status(500).json({ error: "Login failed" });
   } finally {
     client.release();
   }

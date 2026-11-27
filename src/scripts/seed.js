@@ -211,6 +211,13 @@ try {
     const userId = rows[0].id;
     authorIds[a.username] = userId;
 
+    // Forum tables reference forum_members, so each seed author needs a linked member row.
+    await client.query(
+      `INSERT INTO forum_members (id, user_id, email, name) VALUES ($1, $1, $2, $3)
+       ON CONFLICT (id) DO NOTHING`,
+      [userId, `forum-seed-${a.username.replace(/_/g, "-")}@auditprorx.test`, `Forum Seed ${a.username}`]
+    );
+
     await client.query(
       `INSERT INTO forum_profiles (user_id, username, role)
        VALUES ($1, $2, $3)

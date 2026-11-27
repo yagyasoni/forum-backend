@@ -5,7 +5,7 @@ import { PAGE_SIZE, memberColumns, pageResult, parsePage, threadColumns, threadF
 
 const router = Router();
 
-const VALID_ROLES = ["owner", "pharmacist", "technician", "consultant", "student"];
+const VALID_ROLES = ["owner", "pharmacist", "technician", "consultant", "student", "other"];
 const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -15,12 +15,12 @@ router.get("/", requireMember, async (req, res) => {
     // "verified" is the Verified Pharmacy tag: a pharmacy with an NPI or NCPDP on file,
     // the same rule the author columns use. It is not the email-verified flag.
     pool.query(
-      `SELECT u.id, u.email,
+      `SELECT m.id, COALESCE((SELECT u.email FROM users u WHERE u.id = m.user_id), m.email) AS email,
               EXISTS (
                 SELECT 1 FROM pharmacy_details pd
-                WHERE pd.user_id = u.id AND (pd.npi_number IS NOT NULL OR pd.ncpdp_number IS NOT NULL)
+                WHERE pd.user_id = m.user_id AND (pd.npi_number IS NOT NULL OR pd.ncpdp_number IS NOT NULL)
               ) AS verified
-       FROM users u WHERE u.id = $1::uuid`,
+       FROM forum_members m WHERE m.id = $1::uuid`,
       [req.user.id]
     ),
     pool.query(
@@ -142,7 +142,7 @@ router.get("/notifications", requireMember, async (req, res) => {
             fp.username AS actor_username
      FROM forum_notifications n
      JOIN forum_threads t ON t.id = n.thread_id
-     JOIN forum_profiles fp ON fp.user_id = n.actor_id
+     LEFT JOIN forum_profiles fp ON fp.user_id = n.actor_id
      WHERE n.user_id = $1::uuid
      ORDER BY n.created_at DESC
      LIMIT 50`,
@@ -161,7 +161,7 @@ router.get("/notifications", requireMember, async (req, res) => {
       type: n.type,
       threadId: n.thread_id,
       threadTitle: n.thread_title,
-      actor: { username: n.actor_username },
+      actor: { username: n.actor_username ?? "Unknown" },
       isRead: n.is_read,
       createdAt: n.created_at,
     })),
