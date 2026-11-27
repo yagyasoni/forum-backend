@@ -294,37 +294,49 @@ router.post("/", requireMember, requireProfile, async (req, res) => {
 });
 
 // PUT /api/threads/:id/comments/:commentId/like — toggle like, one per member
-router.put("/:id/comments/:commentId/like", requireMember, async (req, res) => {
+router.put("/:id/comments/:commentId/like", requireMember, requireProfile, async (req, res) => {
   const { commentId } = req.params;
   if (!UUID_RE.test(commentId)) return res.status(404).json({ error: "Comment not found" });
 
-  const existing = await pool.query(
-    `SELECT 1 FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
-    [commentId, req.user.id]
-  );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  let delta;
-  if (existing.rowCount > 0) {
-    await pool.query(
-      `DELETE FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+    const existing = await client.query(
+      `SELECT 1 FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
       [commentId, req.user.id]
     );
-    delta = -1;
-  } else {
-    await pool.query(
-      `INSERT INTO forum_comment_likes (comment_id, user_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING`,
-      [commentId, req.user.id]
+
+    let delta;
+    if (existing.rowCount > 0) {
+      await client.query(
+        `DELETE FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+        [commentId, req.user.id]
+      );
+      delta = -1;
+    } else {
+      await client.query(
+        `INSERT INTO forum_comment_likes (comment_id, user_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING`,
+        [commentId, req.user.id]
+      );
+      delta = 1;
+    }
+
+    const updated = await client.query(
+      `UPDATE forum_comments SET like_count = GREATEST(0, like_count + $1) WHERE id = $2::uuid RETURNING like_count`,
+      [delta, commentId]
     );
-    delta = 1;
+
+    await client.query("COMMIT");
+
+    if (updated.rowCount === 0) return res.status(404).json({ error: "Comment not found" });
+    res.json({ likeCount: updated.rows[0].like_count });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const updated = await pool.query(
-    `UPDATE forum_comments SET like_count = GREATEST(0, like_count + $1) WHERE id = $2::uuid RETURNING like_count`,
-    [delta, commentId]
-  );
-  if (updated.rowCount === 0) return res.status(404).json({ error: "Comment not found" });
-
-  res.json({ likeCount: updated.rows[0].like_count });
 });
 
 // POST /api/threads/:id/comments

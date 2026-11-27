@@ -15,17 +15,21 @@ export async function optionalMember(req, res, next) {
   }
 
   try {
+    // The token holds a forum member id. A member linked to AuditProRx also needs an active users row;
+    // a forum-only member (user_id NULL) has none, and only their own status counts.
     const { rows } = await pool.query(
-      `SELECT u.id, u.status, u.role,
+      `SELECT m.id, m.status, m.user_id, u.status AS user_status, u.role,
               fp.username, fp.role AS fp_role, fp.favorite_category_ids
-       FROM users u
-       LEFT JOIN forum_profiles fp ON fp.user_id = u.id
-       WHERE u.id = $1::uuid`,
+       FROM forum_members m
+       LEFT JOIN users u ON u.id = m.user_id
+       LEFT JOIN forum_profiles fp ON fp.user_id = m.id
+       WHERE m.id = $1::uuid`,
       [payload.userId]
     );
 
     const user = rows[0];
-    if (!user || user.status !== "active") {
+    const active = user && user.status === "active" && (user.user_id === null || user.user_status === "active");
+    if (!active) {
       res.clearCookie("forum_session");
       return next();
     }
