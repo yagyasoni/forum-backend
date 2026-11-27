@@ -11,7 +11,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // GET /api/me
 router.get("/", requireMember, async (req, res) => {
-  const [userResult, unreadResult, votesResult] = await Promise.all([
+  const [userResult, unreadResult, votesResult, likesResult] = await Promise.all([
     // "verified" is the Verified Pharmacy tag: a pharmacy with an NPI or NCPDP on file,
     // the same rule the author columns use. It is not the email-verified flag.
     pool.query(
@@ -32,6 +32,12 @@ router.get("/", requireMember, async (req, res) => {
       `SELECT thread_id, value FROM forum_votes WHERE voter_id = $1::text ORDER BY updated_at DESC LIMIT 1000`,
       [req.user.id]
     ),
+    // The comments this member liked. The thread page is rendered by the frontend's own server,
+    // which does not have the member's login, so the browser needs these to show the thumbs right.
+    pool.query(
+      `SELECT comment_id FROM forum_comment_likes WHERE user_id = $1::uuid ORDER BY created_at DESC LIMIT 500`,
+      [req.user.id]
+    ),
   ]);
 
   const u = userResult.rows[0];
@@ -41,6 +47,7 @@ router.get("/", requireMember, async (req, res) => {
     verified: u.verified,
     unread: unreadResult.rows[0].unread,
     votes: Object.fromEntries(votesResult.rows.map((v) => [v.thread_id, v.value])),
+    likedComments: likesResult.rows.map((l) => l.comment_id),
     profile: req.user.profile,
   });
 });

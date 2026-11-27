@@ -43,7 +43,22 @@ export function memberColumns(paramIndex) {
 }
 
 function toExcerpt(text) {
-  return text.length > EXCERPT_LENGTH ? `${text.slice(0, EXCERPT_LENGTH).trimEnd()}…` : text;
+  // The SQL strips the tags but the text is still HTML-encoded ("Rx &amp; OTC"). The excerpt is
+  // shown as plain text, so decode it; a cut that lands inside an entity drops the broken piece.
+  const cut = text.length > EXCERPT_LENGTH;
+  const kept = cut ? text.slice(0, EXCERPT_LENGTH).replace(/&[a-z#0-9]{0,6}$/i, "") : text;
+  const plain = decodeEntities(kept).trimEnd();
+  return cut ? `${plain}…` : plain;
+}
+
+function decodeEntities(text) {
+  return text
+    .replace(/&nbsp;/g, " ")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#x27;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 export function mapThreadRow(row) {

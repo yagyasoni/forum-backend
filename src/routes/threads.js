@@ -19,6 +19,18 @@ const router = Router();
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Search engines and link-preview bots are not readers, so they do not count as views.
+const BOT_RE =
+  /bot|crawler|spider|slurp|crawling|facebookexternalhit|facebookcatalog|WhatsApp|SkypeUriPreview|Google-InspectionTool|Google-PageRenderer|Mediapartners-Google|Lighthouse|ia_archiver/i;
+
+// A view is not counted when the request comes from a bot, or when the forum frontend says the page
+// it is rendering was requested by one (header X-Forum-No-View: 1, since the frontend's own server
+// is what calls this API).
+function countsAsView(req) {
+  if (req.get("x-forum-no-view") === "1") return false;
+  return !BOT_RE.test(req.get("user-agent") ?? "");
+}
+
 // Allowed HTML tags/attrs for thread bodies and comments.
 const SANITIZE_OPTS = {
   allowedTags: ["p", "br", "strong", "em", "u", "ul", "ol", "li", "a"],
@@ -112,14 +124,22 @@ router.get("/:id", async (req, res) => {
 
   const vis = visibilityClause(req);
 
-  const updated = await pool.query(
-    `UPDATE forum_threads t SET view_count = t.view_count + 1
-     FROM forum_categories c
-     WHERE t.id = $1 AND c.id = t.category_id AND NOT t.is_deleted ${vis}
-     RETURNING t.id`,
-    [id]
-  );
-  if (updated.rowCount === 0) return res.status(404).json({ error: "Thread not found" });
+  // Count the view, or for bots just check the thread is visible.
+  const found = countsAsView(req)
+    ? await pool.query(
+        `UPDATE forum_threads t SET view_count = t.view_count + 1
+         FROM forum_categories c
+         WHERE t.id = $1 AND c.id = t.category_id AND NOT t.is_deleted ${vis}
+         RETURNING t.id`,
+        [id]
+      )
+    : await pool.query(
+        `SELECT t.id FROM forum_threads t
+         JOIN forum_categories c ON c.id = t.category_id
+         WHERE t.id = $1 AND NOT t.is_deleted ${vis}`,
+        [id]
+      );
+  if (found.rowCount === 0) return res.status(404).json({ error: "Thread not found" });
 
   const mc = req.user ? memberColumns(2) : "";
   const threadParams = req.user ? [id, req.user.id] : [id];
@@ -293,38 +313,68 @@ router.post("/", requireMember, requireProfile, async (req, res) => {
   res.status(201).json(rows[0]);
 });
 
-// PUT /api/threads/:id/comments/:commentId/like — toggle like, one per member
+// PUT /api/threads/:id/comments/:commentId/like — one like per member per comment.
+// Body { liked: true | false } sets that state (sending it twice changes nothing). Without a body it
+// flips the current state, which is what earlier versions of the frontend expect.
 router.put("/:id/comments/:commentId/like", requireMember, async (req, res) => {
-  const { commentId } = req.params;
-  if (!UUID_RE.test(commentId)) return res.status(404).json({ error: "Comment not found" });
+  const { id, commentId } = req.params;
+  if (!UUID_RE.test(id) || !UUID_RE.test(commentId)) return res.status(404).json({ error: "Comment not found" });
 
-  const existing = await pool.query(
-    `SELECT 1 FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
-    [commentId, req.user.id]
-  );
+  const wanted = typeof req.body?.liked === "boolean" ? req.body.liked : null;
+  const vis = visibilityClause(req);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  let delta;
-  if (existing.rowCount > 0) {
-    await pool.query(
-      `DELETE FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+    // Lock the comment row so two requests for the same comment are applied one after the other
+    // and the count cannot drift. Also confirms the comment exists, belongs to this thread, and
+    // is visible to this member.
+    const found = await client.query(
+      `SELECT cm.id FROM forum_comments cm
+       JOIN forum_threads t ON t.id = cm.thread_id
+       JOIN forum_categories c ON c.id = t.category_id
+       WHERE cm.id = $1::uuid AND cm.thread_id = $2::uuid AND NOT cm.is_deleted AND NOT t.is_deleted ${vis}
+       FOR UPDATE OF cm`,
+      [commentId, id]
+    );
+    if (found.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "Comment not found" });
+    }
+
+    const existing = await client.query(
+      `SELECT 1 FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
       [commentId, req.user.id]
     );
-    delta = -1;
-  } else {
-    await pool.query(
-      `INSERT INTO forum_comment_likes (comment_id, user_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING`,
-      [commentId, req.user.id]
+    const was = existing.rowCount > 0;
+    const liked = wanted === null ? !was : wanted;
+
+    if (liked && !was) {
+      await client.query(
+        `INSERT INTO forum_comment_likes (comment_id, user_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING`,
+        [commentId, req.user.id]
+      );
+    } else if (!liked && was) {
+      await client.query(
+        `DELETE FROM forum_comment_likes WHERE comment_id = $1::uuid AND user_id = $2::uuid`,
+        [commentId, req.user.id]
+      );
+    }
+
+    const delta = (liked ? 1 : 0) - (was ? 1 : 0);
+    const updated = await client.query(
+      `UPDATE forum_comments SET like_count = GREATEST(0, like_count + $1) WHERE id = $2::uuid RETURNING like_count`,
+      [delta, commentId]
     );
-    delta = 1;
+
+    await client.query("COMMIT");
+    res.json({ likeCount: updated.rows[0].like_count, liked });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const updated = await pool.query(
-    `UPDATE forum_comments SET like_count = GREATEST(0, like_count + $1) WHERE id = $2::uuid RETURNING like_count`,
-    [delta, commentId]
-  );
-  if (updated.rowCount === 0) return res.status(404).json({ error: "Comment not found" });
-
-  res.json({ likeCount: updated.rows[0].like_count });
 });
 
 // POST /api/threads/:id/comments

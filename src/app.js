@@ -4,6 +4,7 @@ import express from "express";
 import categoriesRouter from "./routes/categories.js";
 import lookupRouter from "./routes/lookup.js";
 import searchRouter from "./routes/search.js";
+import sitemapRouter from "./routes/sitemap.js";
 import threadsRouter from "./routes/threads.js";
 import authRouter from "./routes/auth.js";
 import meRouter from "./routes/me.js";
@@ -61,6 +62,7 @@ app.use("/api/categories", categoriesRouter);
 app.use("/api/threads", threadsRouter);
 app.use("/api/search", searchRouter);
 app.use("/api/lookup", lookupRouter);
+app.use("/api/sitemap", sitemapRouter);
 
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 

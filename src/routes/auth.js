@@ -23,8 +23,11 @@ function issueToken(userId) {
 }
 
 // Move device votes to the authenticated user inside an open transaction client.
+// Returns { threadId: newScore } for the threads whose score changed, so the browser can correct
+// what it is showing without reloading: that only happens where the member had already voted on a
+// thread from their account and this browser had voted on it again while signed out.
 async function migrateDeviceVotes(client, userId, deviceId) {
-  if (!deviceId || !/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) return;
+  if (!deviceId || !/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) return {};
 
   // Threads the device voted on that the user hasn't voted on: take them over.
   await client.query(
@@ -37,13 +40,15 @@ async function migrateDeviceVotes(client, userId, deviceId) {
   );
 
   // Threads both voted on: remove the device vote and subtract its value from the score.
-  await client.query(
+  const corrected = await client.query(
     `UPDATE forum_threads t SET like_count = t.like_count - v.value
      FROM forum_votes v
-     WHERE v.thread_id = t.id AND v.voter_id = $1`,
+     WHERE v.thread_id = t.id AND v.voter_id = $1
+     RETURNING t.id, t.like_count`,
     [deviceId]
   );
   await client.query(`DELETE FROM forum_votes WHERE voter_id = $1`, [deviceId]);
+  return Object.fromEntries(corrected.rows.map((t) => [t.id, t.like_count]));
 }
 
 // POST /api/auth/google
@@ -95,12 +100,12 @@ router.post("/google", loginRateLimit, async (req, res) => {
       [userId, sub]
     );
 
-    await migrateDeviceVotes(client, userId, deviceId);
+    const scores = await migrateDeviceVotes(client, userId, deviceId);
     await client.query("COMMIT");
 
     const hasProfile = await checkHasProfile(userId);
     res.cookie("forum_session", issueToken(userId), COOKIE_OPTS());
-    res.json({ user: { id: userId, hasProfile } });
+    res.json({ user: { id: userId, hasProfile }, scores });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("Google login error:", err);
@@ -132,12 +137,14 @@ router.post("/login", loginRateLimit, async (req, res) => {
 
   if (user.status !== "active") return res.status(403).json({ error: "Account inactive" });
 
+  let scores = {};
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await migrateDeviceVotes(client, user.id, deviceId);
+    scores = await migrateDeviceVotes(client, user.id, deviceId);
     await client.query("COMMIT");
   } catch (err) {
+    scores = {};
     await client.query("ROLLBACK");
     console.error("Device vote migration error:", err);
   } finally {
@@ -146,7 +153,7 @@ router.post("/login", loginRateLimit, async (req, res) => {
 
   const hasProfile = await checkHasProfile(user.id);
   res.cookie("forum_session", issueToken(user.id), COOKIE_OPTS());
-  res.json({ user: { id: user.id, hasProfile } });
+  res.json({ user: { id: user.id, hasProfile }, scores });
 });
 
 // POST /api/auth/logout
